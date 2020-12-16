@@ -32,10 +32,11 @@ import java.io.{File, FilenameFilter}
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import org.apache.commons.lang.exception.ExceptionUtils
-import org.apache.log4j.Logger
+import org.apache.log4j.{Level, Logger}
 import org.apache.spark.TaskContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.util.AccumulatorV2
+
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.Future
@@ -46,6 +47,7 @@ object DistriOptimizer extends AbstractOptimizer {
   import Optimizer._
 
   val logger: Logger = Logger.getLogger(getClass)
+  logger.setLevel(Level.DEBUG)
 
   /**
    * Optimizer cache some metadata on each executor
@@ -292,6 +294,9 @@ object DistriOptimizer extends AbstractOptimizer {
           val computingTime = System.nanoTime() - time
           driverMetrics.add("computing time average", computingTime)
           driverMetrics.add("computing time for each node", computingTime)
+          print("--------------------------------------------")
+          // print(driverMetrics.get("computing time for each node", partitionNum, 1e9))
+          // logger.debug("\n" + driverMetrics.get(1e9))
 
           val finishedThreads = trainingThreads.filter(!_.isCancelled).map(_.get())
           recordsNum.add(finishedThreads.size * stackSize)
@@ -339,7 +344,7 @@ object DistriOptimizer extends AbstractOptimizer {
               parameters.size))
             driverMetrics.add("put gradient", System.nanoTime() - putG)
           }
-
+          // logger.debug("\n" + driverMetrics.get(1e9)) ok
           tasks ++= Engine.default.invoke {
             (0 until _subModelNumber).map { i =>
               () => {
@@ -368,7 +373,7 @@ object DistriOptimizer extends AbstractOptimizer {
 
         val isGradientUpdated = driverState[Boolean]("isGradientUpdated")
         val stateBroadcast = sc.broadcast(driverState)
-
+        // logger.debug("\n" + driverMetrics.get(1e9)) ok
         models.mapPartitions { modelIter =>
           val (paramLocalStart, paramLocalLen) = parameters.localPartitionRange
           val modelCache = modelIter.next()
@@ -376,6 +381,7 @@ object DistriOptimizer extends AbstractOptimizer {
           if (!isGradientUpdated) {
             val getG = System.nanoTime()
             parameters.aggregateGradientPartition(numFinishedModelUpdates)
+            logger.debug("\n" + driverMetrics.get(1e9))
             driverMetrics.add("aggregrateGradientParition average executor",
               System.nanoTime() - getG)
           }
@@ -675,8 +681,8 @@ object DistriOptimizer extends AbstractOptimizer {
     ev: TensorNumeric[T])
   : Module[T] = {
     val partitionNum = models.partitions.length
-
-    Util.setExtraParametersFromModelRDD(models, trainingModel, maxSize = 500000000)
+    val extraState = models.map(_.localModels.head.getExtraParameter()).first()
+    trainingModel.setExtraParameter(extraState)
 
     // make sure gradient is as the same length as weight
     val parameterArray = trainingModel.parameters()
@@ -725,15 +731,6 @@ class DistriOptimizer[T: ClassTag](
 )(implicit ev: TensorNumeric[T])
   extends Optimizer[T, MiniBatch[T]](
     _model, _dataset, _criterion) {
-
-
-  var compress: String = "fp16"
-
-  def setCompressType(compressType: String): this.type = {
-    compress = compressType
-    this
-  }
-
   val metrics = new Metrics
 
   private var models: RDD[DistriOptimizer.CacheV1[T]] = null
@@ -849,7 +846,7 @@ class DistriOptimizer[T: ClassTag](
     val partitionNum = distDataset.originRDD().partitions.length
     val modelParameters = trainingModel.getParameters()
     val allReduceParameter = AllReduceParameter.newParameter[T](partitionNum,
-      modelParameters._1.nElement(), compress = this.compress)
+      modelParameters._1.nElement())
     // subModuleName -> (storageOffset, length, AllReduceParameter)
     val parameterSplits = if (optimMethods.size != 1) {
       val p = optimMethods.map { case (subModuleName, optimMethod) =>

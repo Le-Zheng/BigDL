@@ -20,6 +20,7 @@ import com.google.common.util.concurrent.AtomicDouble
 import org.apache.spark.SparkContext
 import org.apache.spark.util.{AccumulatorV2, DoubleAccumulator}
 
+import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, Map}
 
 /**
@@ -46,8 +47,7 @@ class Metrics extends Serializable {
     }
 
     if (distributeMetricsMap.contains(name)) {
-      var bufferValue = ArrayBuffer(value)
-      distributeMetricsMap(name).value.add(bufferValue)
+      distributeMetricsMap(name).value.add(value)
     }
     this
   }
@@ -82,13 +82,12 @@ class Metrics extends Serializable {
     require(!localMetricsMap.contains(name), "duplicated local metric")
     require(!aggregateDistributeMetricsMap.contains(name), "duplicated distribute metric")
     if (distributeMetricsMap.contains(name)) {
-      distributeMetricsMap(name).value.reset()
-      distributeMetricsMap(name).value.add(value)
+      distributeMetricsMap(name).value.setValue(value)
     } else {
       val accumulableCollection = new ArrayBufferAccumulator
       sc.register(accumulableCollection)
       distributeMetricsMap(name) = DistributeMetricsEntry(accumulableCollection)
-      distributeMetricsMap(name).value.add(value)
+      distributeMetricsMap(name).value.setValue(value)
     }
     this
   }
@@ -107,6 +106,14 @@ class Metrics extends Serializable {
     require(distributeMetricsMap.contains(name))
     distributeMetricsMap(name).value.value.toArray.dropRight(number)
   }
+// name: String, number: Int, scale: Double
+  def get(scale: Double): String = {
+    // require(distributeMetricsMap.contains(name))
+    distributeMetricsMap.map { entry =>
+      s"${entry._1} : ${entry._2.value.values.toArray.map(_ / scale).mkString(" ")} \n"
+    }.mkString("")
+    // distributeMetricsMap(name).value.values.toArray.map(_ / scale).mkString(" ")
+  }
 
   def summary(unit: String = "s", scale: Double = 1e9): String = {
     "========== Metrics Summary ==========\n" +
@@ -117,7 +124,7 @@ class Metrics extends Serializable {
         entry => s"${entry._1} : ${entry._2.value.value / entry._2.parallel / scale} $unit\n")
         .mkString("") +
       distributeMetricsMap.map { entry =>
-        s"${entry._1} : ${entry._2.value.value.map(_ / scale).mkString(" ")} \n"
+        s"${entry._1} : ${entry._2.value.values.toArray.map(_ / scale).mkString(" ")} \n"
       }.mkString("") +
       "====================================="
   }
@@ -130,19 +137,23 @@ private case class AggregateDistributeMetricsEntry(value: DoubleAccumulator, var
 
 private case class DistributeMetricsEntry(value: ArrayBufferAccumulator)
 
-class ArrayBufferAccumulator extends AccumulatorV2[ArrayBuffer[Double], ArrayBuffer[Double]] {
-  private var values = new ArrayBuffer[Double]()
+class ArrayBufferAccumulator extends AccumulatorV2[Double, ArrayBuffer[Double]] with Serializable {
+  var values = mutable.ArrayBuffer[Double]()
 
   def reset(): Unit = {
-    values.clear()
+    this.values.clear()
   }
 
-  def value: ArrayBuffer[Double] = values
+  def value: ArrayBuffer[Double] = this.values
 
-  def add(v: ArrayBuffer[Double]): Unit = {
-    values ++= v
+  def add(v: Double): Unit = {
+    this.values += v
   }
 
+  def setValue(value: ArrayBuffer[Double]): Unit = {
+    this.values = value
+  }
+  
   def copy(): ArrayBufferAccumulator = {
     val newArrayBufferAccumulator = new ArrayBufferAccumulator
     newArrayBufferAccumulator.values = this.values
@@ -151,7 +162,7 @@ class ArrayBufferAccumulator extends AccumulatorV2[ArrayBuffer[Double], ArrayBuf
 
   def isZero: Boolean = {values.isEmpty}
 
-  def merge(other: AccumulatorV2[ArrayBuffer[Double], ArrayBuffer[Double]]): Unit = other match {
+  def merge(other: AccumulatorV2[Double, ArrayBuffer[Double]]): Unit = other match {
     case o: ArrayBufferAccumulator => values ++= o.values
     case _ => throw new UnsupportedOperationException(
       s"Cannot merge ${this.getClass.getName} with ${other.getClass.getName}"
